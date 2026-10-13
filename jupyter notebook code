@@ -1,0 +1,1036 @@
+"""RiceVKAN-Net model package."""
+
+from .rice_vkan_net import RiceVKANNet
+from .baselines import get_baseline_model
+from .kan_layers import KANLinear
+from .vkan_block import VKANBlock
+from .msvff import MSVFF
+
+__all__ = [
+    "RiceVKANNet",
+    "get_baseline_model",
+    "KANLinear",
+    "VKANBlock",
+    "MSVFF",
+]
+"""
+kan_layers.py — Efficient Kolmogorov-Arnold Network (KAN) layers.
+
+Implements KAN linear layers with learnable B-spline activation functions
+on the edges, replacing standard linear layers for more expressive nonlinear
+transformations.
+
+Reference: Liu et al., "KAN: Kolmogorov-Arnold Networks", arXiv:2404.19756
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+
+
+class KANLinear(nn.Module):
+    """KAN linear layer with B-spline basis functions.
+
+    Instead of y = xW + b (standard linear), this layer computes:
+        y = activation(x) @ base_weight  +  B_spline(x) @ spline_weight
+    where B_spline(x) produces learnable nonlinear transformations per edge.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        grid_size: int = 5,
+        spline_order: int = 3,
+        scale_noise: float = 0.1,
+        scale_base: float = 1.0,
+        scale_spline: float = 1.0,
+        base_activation: type = nn.SiLU,
+        grid_eps: float = 0.02,
+        grid_range: tuple = (-1, 1),
+    ):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.grid_size = grid_size
+        self.spline_order = spline_order
+        self.scale_noise = scale_noise
+        self.scale_base = scale_base
+        self.scale_spline = scale_spline
+        self.grid_eps = grid_eps
+
+        # Uniform grid for B-splines
+        h = (grid_range[1] - grid_range[0]) / grid_size
+        grid = (
+            torch.arange(-spline_order, grid_size + spline_order + 1) * h
+            + grid_range[0]
+        )
+        grid = grid.expand(in_features, -1).contiguous()
+        self.register_buffer("grid", grid)  # (in_features, grid_points)
+
+        # Learnable parameters
+        self.base_weight = nn.Parameter(
+            torch.Tensor(out_features, in_features)
+        )
+        self.spline_weight = nn.Parameter(
+            torch.Tensor(out_features, in_features, grid_size + spline_order)
+        )
+        self.spline_scaler = nn.Parameter(
+            torch.Tensor(out_features, in_features)
+        )
+
+        self.base_activation = base_activation()
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        """Initialize weights."""
+        nn.init.kaiming_uniform_(self.base_weight, a=math.sqrt(5))
+        with torch.no_grad():
+            noise = (
+                (torch.rand_like(self.spline_weight) - 0.5)
+                * self.scale_noise
+                / self.grid_size
+            )
+            self.spline_weight.copy_(
+                self.scale_spline * self._curve2coeff(
+                    torch.linspace(-1, 1, steps=self.grid_size + self.spline_order,
+                                   device=self.spline_weight.device)
+                    .expand(self.in_features, -1),
+                ) + noise
+            )
+            nn.init.kaiming_uniform_(self.spline_scaler, a=math.sqrt(5))
+
+    def _curve2coeff(self, x):
+        """Compute initial spline coefficients from curve values."""
+        bases = self._b_splines(x.unsqueeze(0))
+        coeff = torch.zeros(
+            self.out_features, self.in_features, self.grid_size + self.spline_order,
+            device=x.device
+        )
+        return coeff
+
+    def _b_splines(self, x: torch.Tensor) -> torch.Tensor:
+        """Compute B-spline basis functions using Cox-de Boor recursion.
+
+        Args:
+            x: (batch, in_features) input values
+
+        Returns:
+            bases: (batch, in_features, grid_size + spline_order) basis values
+        """
+        x = x.unsqueeze(-1)  # (batch, in_features, 1)
+        grid = self.grid.unsqueeze(0)  # (1, in_features, grid_points)
+
+        # Order 0
+        bases = ((x >= grid[:, :, :-1]) & (x < grid[:, :, 1:])).float()
+
+        # Higher orders via recursion
+        for k in range(1, self.spline_order + 1):
+            left_num = x - grid[:, :, :-(k + 1)]
+            left_den = grid[:, :, k:-1] - grid[:, :, :-(k + 1)]
+            right_num = grid[:, :, k + 1:] - x
+            right_den = grid[:, :, k + 1:] - grid[:, :, 1:(-k) if -k != 0 else None]
+
+            left = left_num / (left_den + 1e-8) * bases[:, :, :-1]
+            right = right_num / (right_den + 1e-8) * bases[:, :, 1:]
+            bases = left + right
+
+        return bases.contiguous()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass.
+
+        Args:
+            x: (batch, in_features)
+
+        Returns:
+            output: (batch, out_features)
+        """
+        # Base component: activation(x) @ base_weight^T
+        base_output = F.linear(self.base_activation(x), self.base_weight)
+
+        # Spline component
+        spline_basis = self._b_splines(x)  # (batch, in_features, n_basis)
+        spline_output = torch.einsum(
+            "bin,oin->bo", spline_basis, self.spline_weight
+        )
+        # Scale
+        spline_output = spline_output * self.spline_scaler.sum(dim=1).unsqueeze(0)
+
+        return base_output + spline_output
+
+    def regularization_loss(self, regularize_activation=1.0, regularize_entropy=1.0):
+        """Compute regularization loss for spline weights (L1 + entropy)."""
+        l1_norm = self.spline_weight.abs().mean()
+        p = self.spline_weight.abs() / (self.spline_weight.abs().sum(dim=-1, keepdim=True) + 1e-8)
+        entropy = -(p * (p + 1e-8).log()).sum(dim=-1).mean()
+        return regularize_activation * l1_norm + regularize_entropy * entropy
+
+
+class KANLayer(nn.Module):
+    """Convenience wrapper: KANLinear + optional LayerNorm + Dropout."""
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        grid_size: int = 5,
+        spline_order: int = 3,
+        dropout: float = 0.0,
+        use_layernorm: bool = False,
+    ):
+        super().__init__()
+        layers = []
+        if use_layernorm:
+            layers.append(nn.LayerNorm(in_features))
+        layers.append(KANLinear(in_features, out_features, grid_size, spline_order))
+        if dropout > 0:
+            layers.append(nn.Dropout(dropout))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+"""
+vkan_block.py — VKAN block combining VSS (Mamba) + EFC-KAN + CBAM.
+
+The core innovation of RiceVKAN-Net: Visual State Space for global context,
+Expanded Field Convolutional KAN for nonlinear channel modulation, and
+CBAM for attention refinement.
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import warnings
+
+# ─── Try to import Mamba; fall back to attention if unavailable ─────────
+try:
+    from mamba_ssm import Mamba
+    HAS_MAMBA = True
+except ImportError:
+    HAS_MAMBA = False
+    warnings.warn(
+        "mamba-ssm not installed. Falling back to MultiheadAttention for SS2D. "
+        "Install with: pip install causal-conv1d>=1.1.1 mamba-ssm>=2.2.2"
+    )
+
+from .kan_layers import KANLinear
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  SS2D — Selective Scan 2D (Mamba for 2D feature maps)
+# ═══════════════════════════════════════════════════════════════════════
+
+class SS2D(nn.Module):
+    """Apply Mamba selective state-space scan to 2D feature maps.
+
+    Scans the feature map in 4 directions (horizontal forward/backward,
+    vertical forward/backward) using separate Mamba instances, then merges
+    the results for comprehensive global context.
+    """
+
+    def __init__(self, d_model: int, d_state: int = 16, d_conv: int = 3, expand: int = 2):
+        super().__init__()
+        self.d_model = d_model
+
+        if HAS_MAMBA:
+            self.mamba_fwd = Mamba(d_model, d_state=d_state, d_conv=d_conv, expand=expand)
+            self.mamba_bwd = Mamba(d_model, d_state=d_state, d_conv=d_conv, expand=expand)
+            self.mamba_vfwd = Mamba(d_model, d_state=d_state, d_conv=d_conv, expand=expand)
+            self.mamba_vbwd = Mamba(d_model, d_state=d_state, d_conv=d_conv, expand=expand)
+        else:
+            # Fallback: use multi-head attention for global modeling
+            self.attn = nn.MultiheadAttention(d_model, num_heads=8, batch_first=True)
+            self.attn_norm = nn.LayerNorm(d_model)
+
+        self.out_norm = nn.LayerNorm(d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (B, C, H, W)
+        Returns:
+            (B, C, H, W) with global context
+        """
+        B, C, H, W = x.shape
+
+        if HAS_MAMBA:
+            return self._mamba_forward(x, B, C, H, W)
+        else:
+            return self._attention_forward(x, B, C, H, W)
+
+    def _mamba_forward(self, x, B, C, H, W):
+        # Horizontal scans (row-major)
+        x_seq = x.permute(0, 2, 3, 1).reshape(B, H * W, C)  # (B, L, C)
+        y_fwd = self.mamba_fwd(x_seq)
+        y_bwd = self.mamba_bwd(x_seq.flip(1)).flip(1)
+
+        # Vertical scans (column-major: transpose H,W)
+        x_vert = x.permute(0, 3, 2, 1).reshape(B, H * W, C)  # (B, L, C)
+        y_vfwd = self.mamba_vfwd(x_vert)
+        y_vbwd = self.mamba_vbwd(x_vert.flip(1)).flip(1)
+
+        # Reshape vertical results back to row-major order
+        y_vfwd = y_vfwd.reshape(B, W, H, C).permute(0, 2, 1, 3).reshape(B, H * W, C)
+        y_vbwd = y_vbwd.reshape(B, W, H, C).permute(0, 2, 1, 3).reshape(B, H * W, C)
+
+        # Merge all 4 directions
+        y = (y_fwd + y_bwd + y_vfwd + y_vbwd) / 4.0
+        y = self.out_norm(y)
+        y = self.out_proj(y)
+        y = y.reshape(B, H, W, C).permute(0, 3, 1, 2)  # (B, C, H, W)
+        return y
+
+    def _attention_forward(self, x, B, C, H, W):
+        x_seq = x.permute(0, 2, 3, 1).reshape(B, H * W, C)
+        x_norm = self.attn_norm(x_seq)
+        attn_out, _ = self.attn(x_norm, x_norm, x_norm)
+        y = self.out_norm(x_seq + attn_out)
+        y = self.out_proj(y)
+        y = y.reshape(B, H, W, C).permute(0, 3, 1, 2)
+        return y
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  EFCKAN — Expanded Field Convolutional KAN
+# ═══════════════════════════════════════════════════════════════════════
+
+class EFCKAN(nn.Module):
+    """Expanded-Field Convolutional KAN for nonlinear channel modulation.
+
+    Combines depthwise convolutions (for local spatial context) with KAN
+    layers (for learnable nonlinear channel transformations).
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        expand_ratio: int = 4,
+        grid_size: int = 5,
+        spline_order: int = 3,
+        use_kan: bool = True,
+    ):
+        super().__init__()
+        self.use_kan = use_kan
+
+        # Spatial path: depthwise convolutions with expanded field
+        self.dw_conv3 = nn.Sequential(
+            nn.Conv2d(dim, dim, 3, padding=1, groups=dim, bias=False),
+            nn.BatchNorm2d(dim),
+            nn.GELU(),
+        )
+        self.dw_conv5 = nn.Sequential(
+            nn.Conv2d(dim, dim, 5, padding=2, groups=dim, bias=False),
+            nn.BatchNorm2d(dim),
+            nn.GELU(),
+        )
+
+        # Channel path: KAN or MLP for channel modulation
+        hidden_dim = dim * expand_ratio
+        if use_kan:
+            self.channel_fc = nn.Sequential(
+                KANLinear(dim, hidden_dim, grid_size=grid_size, spline_order=spline_order),
+                KANLinear(hidden_dim, dim, grid_size=grid_size, spline_order=spline_order),
+            )
+        else:
+            # Ablation A2: standard MLP
+            self.channel_fc = nn.Sequential(
+                nn.Linear(dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, dim),
+            )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (B, C, H, W)
+        Returns:
+            (B, C, H, W)
+        """
+        # Spatial features via depthwise convolutions
+        spatial = self.dw_conv3(x) + self.dw_conv5(x)
+
+        # Channel modulation via KAN (using global average pooling)
+        pooled = F.adaptive_avg_pool2d(spatial, 1).flatten(1)  # (B, C)
+        channel_weights = self.channel_fc(pooled)  # (B, C)
+        channel_weights = channel_weights.unsqueeze(-1).unsqueeze(-1)  # (B, C, 1, 1)
+
+        # Modulate spatial features + residual
+        out = spatial * channel_weights.sigmoid() + x
+        return out
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  CBAM — Convolutional Block Attention Module
+# ═══════════════════════════════════════════════════════════════════════
+
+class ChannelAttention(nn.Module):
+    """Channel attention sub-module of CBAM."""
+
+    def __init__(self, channels: int, reduction: int = 16):
+        super().__init__()
+        mid = max(channels // reduction, 8)
+        self.fc = nn.Sequential(
+            nn.Linear(channels, mid, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(mid, channels, bias=False),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, _, _ = x.shape
+        avg_pool = F.adaptive_avg_pool2d(x, 1).view(B, C)
+        max_pool = F.adaptive_max_pool2d(x, 1).view(B, C)
+        attn = (self.fc(avg_pool) + self.fc(max_pool)).sigmoid()
+        return x * attn.view(B, C, 1, 1)
+
+
+class SpatialAttention(nn.Module):
+    """Spatial attention sub-module of CBAM."""
+
+    def __init__(self, kernel_size: int = 7):
+        super().__init__()
+        padding = kernel_size // 2
+        self.conv = nn.Conv2d(2, 1, kernel_size, padding=padding, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        avg_out = x.mean(dim=1, keepdim=True)
+        max_out = x.max(dim=1, keepdim=True)[0]
+        attn = torch.cat([avg_out, max_out], dim=1)
+        attn = self.conv(attn).sigmoid()
+        return x * attn
+
+
+class CBAM(nn.Module):
+    """Convolutional Block Attention Module.
+
+    Sequentially applies channel attention then spatial attention.
+    """
+
+    def __init__(self, channels: int, reduction: int = 16, use_cbam: bool = True):
+        super().__init__()
+        self.use_cbam = use_cbam
+        if use_cbam:
+            self.channel_attn = ChannelAttention(channels, reduction)
+            self.spatial_attn = SpatialAttention()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.use_cbam:
+            return x
+        x = self.channel_attn(x)
+        x = self.spatial_attn(x)
+        return x
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  PatchEmbedding & PatchMerging
+# ═══════════════════════════════════════════════════════════════════════
+
+class PatchEmbedding(nn.Module):
+    """Downsample spatial resolution and project channels via convolution."""
+
+    def __init__(self, in_channels: int, embed_dim: int, patch_size: int = 2):
+        super().__init__()
+        self.proj = nn.Conv2d(in_channels, embed_dim, kernel_size=patch_size, stride=patch_size)
+        self.norm = nn.BatchNorm2d(embed_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.proj(x)
+        x = self.norm(x)
+        return x
+
+
+class PatchMerging(nn.Module):
+    """Downsample by 2x and double channels (Swin-style patch merging)."""
+
+    def __init__(self, in_channels: int, out_channels: int):
+        super().__init__()
+        self.reduction = nn.Conv2d(in_channels, out_channels, kernel_size=2, stride=2, bias=False)
+        self.norm = nn.BatchNorm2d(out_channels)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.reduction(x)
+        x = self.norm(x)
+        return x
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  VKANBlock — The Full VKAN Block
+# ═══════════════════════════════════════════════════════════════════════
+
+class VKANBlock(nn.Module):
+    """VKAN block: VSS (Mamba) + local Conv + EFC-KAN + CBAM with residual.
+
+    This is the core building block of RiceVKAN-Net, combining:
+    - Global context via Mamba selective state-space scanning (SS2D)
+    - Local spatial interaction via 3x3 convolutions
+    - Nonlinear channel modulation via KAN (EFC-KAN)
+    - Feature refinement via CBAM attention
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        d_state: int = 16,
+        d_conv: int = 3,
+        expand: int = 2,
+        kan_grid_size: int = 5,
+        kan_spline_order: int = 3,
+        use_vss: bool = True,
+        use_kan: bool = True,
+        use_cbam: bool = True,
+    ):
+        super().__init__()
+        self.use_vss = use_vss
+
+        # Pre-norm
+        self.norm = nn.BatchNorm2d(dim)
+
+        # 1. Global context via SS2D (Mamba)
+        if use_vss:
+            self.ss2d = SS2D(dim, d_state=d_state, d_conv=d_conv, expand=expand)
+
+        # 2. Local spatial interaction
+        self.local_conv = nn.Sequential(
+            nn.Conv2d(dim, dim, 3, padding=1, bias=False),
+            nn.BatchNorm2d(dim),
+            nn.GELU(),
+            nn.Conv2d(dim, dim, 3, padding=1, bias=False),
+            nn.BatchNorm2d(dim),
+            nn.GELU(),
+        )
+
+        # 3. EFC-KAN for nonlinear channel modulation
+        self.efckan = EFCKAN(
+            dim, expand_ratio=4,
+            grid_size=kan_grid_size,
+            spline_order=kan_spline_order,
+            use_kan=use_kan,
+        )
+
+        # 4. CBAM attention
+        self.cbam = CBAM(dim, reduction=16, use_cbam=use_cbam)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (B, C, H, W)
+        Returns:
+            (B, C, H, W) with residual connection
+        """
+        residual = x
+        out = self.norm(x)
+
+        # Global context
+        if self.use_vss:
+            out = self.ss2d(out)
+
+        # Local interaction
+        out = self.local_conv(out)
+
+        # Nonlinear channel modulation
+        out = self.efckan(out)
+
+        # Attention refinement
+        out = self.cbam(out)
+
+        # Residual connection
+        return out + residual
+"""
+msvff.py — Multi-Scale VKAN Feature Fusion module.
+
+Fuses features from multiple encoder stages using learnable attention-weighted
+aggregation, capturing both fine-grained lesion textures (early stages) and
+high-level disease patterns (deep stages).
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class MSVFF(nn.Module):
+    """Multi-Scale VKAN Feature Fusion.
+
+    Projects features from each encoder stage to a common dimension, then
+    applies learnable attention weights to fuse them into a single feature
+    vector for classification.
+    """
+
+    def __init__(self, in_channels_list: list, out_dim: int = 512):
+        """
+        Args:
+            in_channels_list: Channel counts from each stage, e.g. [64, 128, 256, 512]
+            out_dim: Output feature dimension
+        """
+        super().__init__()
+        self.num_scales = len(in_channels_list)
+        self.out_dim = out_dim
+
+        # Per-scale projection: GAP -> Linear -> BN -> GELU
+        self.projections = nn.ModuleList()
+        for c in in_channels_list:
+            self.projections.append(nn.Sequential(
+                nn.Linear(c, out_dim),
+                nn.BatchNorm1d(out_dim),
+                nn.GELU(),
+            ))
+
+        # Learnable attention over scales
+        self.scale_attention = nn.Sequential(
+            nn.Linear(out_dim, out_dim // 4),
+            nn.ReLU(inplace=True),
+            nn.Linear(out_dim // 4, 1),
+        )
+
+        # Store attention weights for visualization
+        self._attention_weights = None
+
+    def forward(self, features: list) -> torch.Tensor:
+        """
+        Args:
+            features: List of feature maps [(B, C1, H1, W1), ..., (B, Cn, Hn, Wn)]
+
+        Returns:
+            fused: (B, out_dim) fused feature vector
+        """
+        projected = []
+        for i, (feat, proj) in enumerate(zip(features, self.projections)):
+            # Global average pooling -> flatten
+            pooled = F.adaptive_avg_pool2d(feat, 1).flatten(1)  # (B, Ci)
+            projected.append(proj(pooled))  # (B, out_dim)
+
+        # Stack: (B, num_scales, out_dim)
+        stacked = torch.stack(projected, dim=1)
+
+        # Compute attention weights per scale
+        attn_logits = self.scale_attention(stacked)  # (B, num_scales, 1)
+        attn_weights = F.softmax(attn_logits, dim=1)  # (B, num_scales, 1)
+
+        # Store for visualization
+        self._attention_weights = attn_weights.detach()
+
+        # Weighted sum
+        fused = (stacked * attn_weights).sum(dim=1)  # (B, out_dim)
+        return fused
+
+    def get_attention_weights(self) -> torch.Tensor:
+        """Return the last computed attention weights for visualization."""
+        return self._attention_weights
+"""
+rice_vkan_net.py — The main RiceVKAN-Net model.
+
+Assembles the hierarchical encoder (Conv stages + VKAN blocks), MSVFF fusion,
+and KAN classification head into a single end-to-end model.
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from .vkan_block import VKANBlock, PatchEmbedding, PatchMerging
+from .msvff import MSVFF
+from .kan_layers import KANLinear
+
+
+def _conv_bn_gelu(in_ch: int, out_ch: int) -> nn.Sequential:
+    """Conv 3x3 -> BatchNorm -> GELU helper."""
+    return nn.Sequential(
+        nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False),
+        nn.BatchNorm2d(out_ch),
+        nn.GELU(),
+    )
+
+
+class RiceVKANNet(nn.Module):
+    """RiceVKAN-Net: VKAN-based rice disease classification network.
+
+    Architecture:
+        Stage 1: Conv blocks -> local features (64 ch)
+        Stage 2: Conv blocks -> mid-level features (128 ch)
+        Stage 3: PatchEmbed + VKAN blocks -> global features (256->512 ch)
+        Stage 4: MSVFF -> multi-scale fusion (512-d vector)
+        Stage 5: KAN classification head -> 8 classes
+    """
+
+    def __init__(self, cfg):
+        super().__init__()
+        self.cfg = cfg
+        ch = cfg.enc_channels  # [64, 128, 256, 512]
+
+        # ── Stage 1: Local features ──────────────────────────────────
+        self.stage1 = nn.Sequential(
+            _conv_bn_gelu(3, ch[0]),
+            _conv_bn_gelu(ch[0], ch[0]),
+        )
+        self.pool1 = nn.MaxPool2d(2)  # 224->112
+
+        # ── Stage 2: Mid-level features ──────────────────────────────
+        self.stage2 = nn.Sequential(
+            _conv_bn_gelu(ch[0], ch[1]),
+            _conv_bn_gelu(ch[1], ch[1]),
+        )
+        self.pool2 = nn.MaxPool2d(2)  # 112->56
+
+        # ── Stage 3: VKAN or fallback Conv ───────────────────────────
+        self.use_vkan = cfg.use_vkan_blocks
+        if self.use_vkan:
+            self.patch_embed = PatchEmbedding(ch[1], ch[2], patch_size=2)  # 56->28
+            self.vkan1 = VKANBlock(
+                ch[2],
+                d_state=cfg.vkan_d_state,
+                d_conv=cfg.vkan_d_conv,
+                expand=cfg.vkan_expand,
+                kan_grid_size=cfg.kan_grid_size,
+                kan_spline_order=cfg.kan_spline_order,
+                use_vss=cfg.use_vss_in_vkan,
+                use_kan=cfg.use_kan_in_vkan,
+                use_cbam=cfg.use_cbam,
+            )
+            self.patch_merge = PatchMerging(ch[2], ch[3])  # 28->14
+            self.vkan2 = VKANBlock(
+                ch[3],
+                d_state=cfg.vkan_d_state,
+                d_conv=cfg.vkan_d_conv,
+                expand=cfg.vkan_expand,
+                kan_grid_size=cfg.kan_grid_size,
+                kan_spline_order=cfg.kan_spline_order,
+                use_vss=cfg.use_vss_in_vkan,
+                use_kan=cfg.use_kan_in_vkan,
+                use_cbam=cfg.use_cbam,
+            )
+        else:
+            # Ablation A1: replace VKAN with standard Conv blocks
+            self.stage3_conv = nn.Sequential(
+                _conv_bn_gelu(ch[1], ch[2]),
+                _conv_bn_gelu(ch[2], ch[2]),
+                nn.MaxPool2d(2),  # 56->28
+                _conv_bn_gelu(ch[2], ch[3]),
+                _conv_bn_gelu(ch[3], ch[3]),
+                nn.MaxPool2d(2),  # 28->14
+            )
+
+        # ── Stage 4: MSVFF or simple GAP ─────────────────────────────
+        self.use_msvff = cfg.use_msvff
+        if self.use_msvff:
+            self.msvff = MSVFF(ch, out_dim=cfg.msvff_out_dim)
+        else:
+            self.gap = nn.AdaptiveAvgPool2d(1)
+
+        # ── Stage 5: Classification head ─────────────────────────────
+        head_in = cfg.msvff_out_dim if cfg.use_msvff else ch[3]
+        if cfg.use_kan_head:
+            self.classifier = nn.Sequential(
+                nn.Dropout(cfg.head_dropout),
+                KANLinear(head_in, cfg.head_hidden_dim,
+                          grid_size=cfg.kan_grid_size,
+                          spline_order=cfg.kan_spline_order),
+                nn.Dropout(cfg.head_dropout2),
+                KANLinear(cfg.head_hidden_dim, cfg.num_classes,
+                          grid_size=cfg.kan_grid_size,
+                          spline_order=cfg.kan_spline_order),
+            )
+        else:
+            # Ablation A5: standard FC head
+            self.classifier = nn.Sequential(
+                nn.Dropout(cfg.head_dropout),
+                nn.Linear(head_in, cfg.head_hidden_dim),
+                nn.GELU(),
+                nn.Dropout(cfg.head_dropout2),
+                nn.Linear(cfg.head_hidden_dim, cfg.num_classes),
+            )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        """Initialize convolutional and linear weights."""
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def _get_stage_features(self, x: torch.Tensor):
+        """Extract features from each encoder stage.
+
+        Returns:
+            features: list of 4 feature maps [F1, F2, F3, F4]
+        """
+        # Stage 1
+        f1 = self.stage1(x)              # (B, 64, 224, 224)
+        x = self.pool1(f1)               # (B, 64, 112, 112)
+
+        # Stage 2
+        f2 = self.stage2(x)              # (B, 128, 112, 112)
+        x = self.pool2(f2)               # (B, 128, 56, 56)
+
+        # Stage 3
+        if self.use_vkan:
+            x = self.patch_embed(x)      # (B, 256, 28, 28)
+            f3 = self.vkan1(x)           # (B, 256, 28, 28)
+            x = self.patch_merge(f3)     # (B, 512, 14, 14)
+            f4 = self.vkan2(x)           # (B, 512, 14, 14)
+        else:
+            x = self.stage3_conv(x)      # (B, 512, 14, 14)
+            f3 = x
+            f4 = x
+
+        return [f1, f2, f3, f4]
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (B, 3, 224, 224) input image batch
+        Returns:
+            logits: (B, num_classes)
+        """
+        features = self._get_stage_features(x)
+
+        # Fusion
+        if self.use_msvff:
+            fused = self.msvff(features)  # (B, msvff_out_dim)
+        else:
+            fused = self.gap(features[-1]).flatten(1)  # (B, 512)
+
+        # Classify
+        logits = self.classifier(fused)
+        return logits
+
+    def get_features(self, x: torch.Tensor) -> torch.Tensor:
+        """Extract the fused feature vector (before classifier) for t-SNE etc."""
+        features = self._get_stage_features(x)
+        if self.use_msvff:
+            return self.msvff(features)
+        else:
+            return self.gap(features[-1]).flatten(1)
+
+    def get_stage_features(self, x: torch.Tensor) -> list:
+        """Public method to get per-stage feature maps for visualization."""
+        return self._get_stage_features(x)
+"""
+baselines.py — Baseline model loader and CNN+KAN hybrid.
+
+Provides functions to load pretrained baseline models from timm for fair
+comparison, plus a CNN+KAN hybrid that combines a CNN backbone with a KAN
+classification head.
+"""
+
+import torch
+import torch.nn as nn
+import timm
+
+from .kan_layers import KANLinear
+
+
+def count_parameters(model: nn.Module) -> int:
+    """Count total trainable parameters."""
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+def get_baseline_model(model_name: str, num_classes: int = 8, pretrained: bool = True) -> nn.Module:
+    """Load a pretrained baseline model from timm."""
+    model = timm.create_model(model_name, pretrained=pretrained, num_classes=num_classes)
+    params = count_parameters(model)
+    print(f"[Baseline] {model_name}: {params:,} trainable parameters")
+    return model
+
+
+class CNNKANHybrid(nn.Module):
+    """Hybrid model: pretrained CNN backbone + KAN classification head."""
+
+    def __init__(
+        self,
+        backbone_name: str = "efficientnet_b4",
+        num_classes: int = 8,
+        pretrained: bool = True,
+        grid_size: int = 5,
+        spline_order: int = 3,
+        head_hidden: int = 128,
+        dropout: float = 0.4,
+    ):
+        super().__init__()
+        self.backbone = timm.create_model(backbone_name, pretrained=pretrained, num_classes=0)
+        feat_dim = self.backbone.num_features
+
+        self.classifier = nn.Sequential(
+            nn.Dropout(dropout),
+            KANLinear(feat_dim, head_hidden, grid_size=grid_size, spline_order=spline_order),
+            nn.Dropout(dropout * 0.75),
+            KANLinear(head_hidden, num_classes, grid_size=grid_size, spline_order=spline_order),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        features = self.backbone(x)
+        return self.classifier(features)
+
+
+def get_cnn_kan_hybrid(
+    backbone_name: str = "efficientnet_b4",
+    num_classes: int = 8,
+    pretrained: bool = True,
+    grid_size: int = 5,
+) -> nn.Module:
+    """Create a CNN+KAN hybrid model."""
+    model = CNNKANHybrid(
+        backbone_name=backbone_name,
+        num_classes=num_classes,
+        pretrained=pretrained,
+        grid_size=grid_size,
+    )
+    params = count_parameters(model)
+    print(f"[CNN+KAN Hybrid] {backbone_name} + KAN Head: {params:,} trainable parameters")
+    return model
+"""
+config.py — Central configuration for RiceVKAN-Net.
+
+All hyperparameters, paths, and experimental settings in one place.
+"""
+
+import os
+from dataclasses import dataclass, field
+from typing import List, Tuple
+
+
+@dataclass
+class Config:
+    """Master configuration for all experiments."""
+
+    # ─── Project ───────────────────────────────────────────────────────
+    project_name: str = "RiceVKAN-Net"
+    seed: int = 42
+    device: str = "cuda"
+    gpu_id: int = 0
+    num_workers: int = 8
+    pin_memory: bool = True
+
+    # ─── Dataset ───────────────────────────────────────────────────────
+    data_root: str = "./data/RiceDataset"
+    num_classes: int = 8
+    class_names: List[str] = field(default_factory=lambda: [
+        "Bacterial Leaf Blight",
+        "Brown Spot",
+        "Healthy Rice Leaf",
+        "Leaf Blast",
+        "Leaf scald",
+        "Narrow Brown Leaf Spot",
+        "Rice Hispa",
+        "Sheath Blight",
+    ])
+    image_size: int = 224
+    resize_size: int = 256
+    img_mean: Tuple[float, ...] = (0.485, 0.456, 0.406)
+    img_std: Tuple[float, ...] = (0.229, 0.224, 0.225)
+
+    # ─── Training ──────────────────────────────────────────────────────
+    epochs: int = 100
+    batch_size: int = 32
+    learning_rate: float = 1e-4
+    weight_decay: float = 1e-4
+    optimizer: str = "adamw"
+    scheduler: str = "cosine_warm"
+    warmup_epochs: int = 5
+    cosine_t0: int = 10
+    cosine_t_mult: int = 2
+    gradient_clip: float = 1.0
+    label_smoothing: float = 0.1
+    early_stopping_patience: int = 15
+
+    # ─── Augmentation ─────────────────────────────────────────────────
+    mixup_alpha: float = 0.2
+    cutmix_alpha: float = 1.0
+    mixup_prob: float = 0.5
+
+    # ─── Model (RiceVKAN-Net) ─────────────────────────────────────────
+    enc_channels: List[int] = field(default_factory=lambda: [64, 128, 256, 512])
+    vkan_d_state: int = 16
+    vkan_d_conv: int = 3
+    vkan_expand: int = 2
+    kan_grid_size: int = 5
+    kan_spline_order: int = 3
+    msvff_out_dim: int = 512
+    head_hidden_dim: int = 128
+    head_dropout: float = 0.4
+    head_dropout2: float = 0.3
+
+    # ─── Ablation flags ───────────────────────────────────────────────
+    use_vkan_blocks: bool = True     # A1: Replace VKAN -> Conv
+    use_kan_in_vkan: bool = True     # A2: Replace EFC-KAN -> MLP
+    use_vss_in_vkan: bool = True     # A3: Remove VSS
+    use_msvff: bool = True           # A4: Remove MSVFF
+    use_kan_head: bool = True        # A5: Replace KAN Head -> FC
+    use_cbam: bool = True            # A6: Remove CBAM
+
+    # ─── K-Fold Cross-Validation ──────────────────────────────────────
+    k_folds: int = 5
+    use_kfold: bool = False
+
+    # ─── Paths (auto-generated) ───────────────────────────────────────
+    output_dir: str = "./outputs"
+    checkpoint_dir: str = ""
+    log_dir: str = ""
+    vis_dir: str = ""
+
+    def __post_init__(self):
+        self.checkpoint_dir = os.path.join(self.output_dir, "checkpoints")
+        self.log_dir = os.path.join(self.output_dir, "logs")
+        self.vis_dir = os.path.join(self.output_dir, "visualizations")
+
+    def make_dirs(self):
+        """Create all output directories."""
+        for d in [self.output_dir, self.checkpoint_dir, self.log_dir, self.vis_dir]:
+            os.makedirs(d, exist_ok=True)
+
+
+# ─── Baseline model names ─────────────────────────────────────────────
+BASELINE_MODELS = [
+    "resnet50", "resnet101", "efficientnet_b4", "densenet121",
+    "mobilenetv3_large_100", "convnext_tiny",
+    "vit_base_patch16_224", "swin_tiny_patch4_window7_224",
+    "deit_small_patch16_224", "vit_small_patch16_224",
+]
+
+# ─── Ablation configurations ──────────────────────────────────────────
+ABLATION_CONFIGS = {
+    "full": {
+        "use_vkan_blocks": True, "use_kan_in_vkan": True,
+        "use_vss_in_vkan": True, "use_msvff": True,
+        "use_kan_head": True, "use_cbam": True,
+    },
+    "A1_no_vkan": {
+        "use_vkan_blocks": False, "use_kan_in_vkan": True,
+        "use_vss_in_vkan": True, "use_msvff": True,
+        "use_kan_head": True, "use_cbam": True,
+    },
+    "A2_no_kan_in_vkan": {
+        "use_vkan_blocks": True, "use_kan_in_vkan": False,
+        "use_vss_in_vkan": True, "use_msvff": True,
+        "use_kan_head": True, "use_cbam": True,
+    },
+    "A3_no_vss": {
+        "use_vkan_blocks": True, "use_kan_in_vkan": True,
+        "use_vss_in_vkan": False, "use_msvff": True,
+        "use_kan_head": True, "use_cbam": True,
+    },
+    "A4_no_msvff": {
+        "use_vkan_blocks": True, "use_kan_in_vkan": True,
+        "use_vss_in_vkan": True, "use_msvff": False,
+        "use_kan_head": True, "use_cbam": True,
+    },
+    "A5_no_kan_head": {
+        "use_vkan_blocks": True, "use_kan_in_vkan": True,
+        "use_vss_in_vkan": True, "use_msvff": True,
+        "use_kan_head": False, "use_cbam": True,
+    },
+    "A6_no_cbam": {
+        "use_vkan_blocks": True, "use_kan_in_vkan": True,
+        "use_vss_in_vkan": True, "use_msvff": True,
+        "use_kan_head": True, "use_cbam": False,
+    },
+}
